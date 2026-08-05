@@ -219,8 +219,14 @@ def run_soak(
                 if remaining > 0.00035:
                     time.sleep(min(0.002, remaining - 0.00035))
                 else:
-                    while time.monotonic() < deadline:
-                        pass
+                    # Mirror the frontend's micro-sleep tail to avoid a full
+                    # busy-spin while preserving sub-millisecond pacing.
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        if remaining > 0.00008:
+                            time.sleep(0.00008)
                     break
 
             if not audio_started and reservoir >= prebuffer_samples:

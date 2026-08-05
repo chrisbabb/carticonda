@@ -825,6 +825,11 @@ class Console:
         apu = self.apu
         cpu = self.cpu
         bus = self.bus
+        begin_instruction = self._begin_instruction
+        finish_instruction = self._finish_instruction
+        end_instruction = self._end_instruction
+        drain_stalls = self._drain_stalls
+        idle_batching = self.idle_batching
         cpu.begin_translated_block_frame()
         ppu.frame_complete = False
 
@@ -841,18 +846,18 @@ class Console:
                     or bus.dma_stall_cycles
                     or apu.cpu_stall_cycles
                 ):
-                    self._drain_stalls()
+                    drain_stalls()
                     continue
                 instruction_pc = cpu.pc
-                self._begin_instruction()
+                begin_instruction()
                 cycles = cpu_step()
-                remaining = self._finish_instruction(cycles)
+                remaining = finish_instruction(cycles)
                 apu_step_many(remaining)
                 ppu_step_fast(remaining * 3)
                 bus.cpu_cycles += remaining
-                self._end_instruction(cycles)
+                end_instruction(cycles)
                 if (
-                    self.idle_batching
+                    idle_batching
                     and cycles == 3
                     and cpu.last_opcode == 0x4C
                     and cpu.pc == instruction_pc
@@ -879,15 +884,15 @@ class Console:
                 or bus.dma_stall_cycles
                 or apu.cpu_stall_cycles
             ):
-                self._drain_stalls()
+                drain_stalls()
                 continue
-            self._begin_instruction()
+            begin_instruction()
             cycles = cpu_step()
-            remaining = self._finish_instruction(cycles)
+            remaining = finish_instruction(cycles)
             apu_step_many(remaining)
             ppu_step_accurate(remaining * 3)
             bus.cpu_cycles += remaining
-            self._end_instruction(cycles)
+            end_instruction(cycles)
         return ppu.take_frame(copy=copy_frame)
 
     def _flush_pending_devices(self) -> None:
@@ -1124,9 +1129,26 @@ class Console:
         mapper_number = self.cartridge.mapper_number
         can_defer_ppu_stream = mapper_number == 9
         can_batch_cpu_dac = mapper_number == 9
+        begin_instruction = self._begin_instruction
+        finish_instruction = self._finish_instruction
+        end_instruction = self._end_instruction
+        drain_stalls = self._drain_stalls
+        flush_pending_devices = self._flush_pending_devices
+        refresh_device_batch_limit = self._refresh_device_batch_limit
+        record_cpu_span = self._record_cpu_span
+        commit_cpu_batch = self._commit_cpu_batch
+        commit_cpu_driven_pcm_batch = self._commit_cpu_driven_pcm_batch
+        batch_dmc_ram_poll = self._batch_dmc_ram_poll
+        batch_cartridge_self_jump = self._batch_cartridge_self_jump
+        batch_ppu_config_status_wait = self._batch_ppu_config_status_wait
+        batch_ppu_status_wait = self._batch_ppu_status_wait
+        batch_ppu_sprite_hit_wait = self._batch_ppu_sprite_hit_wait
+        can_defer_ppu_data = self._can_defer_ppu_data
+        idle_batching = self.idle_batching
+        diagnostics_enabled = self.diagnostic_hot_cycles is not None
         self._pending_cpu_cycles = 0
         self._device_batch_limit = 0
-        bus.sync_devices = self._flush_pending_devices
+        bus.sync_devices = flush_pending_devices
         try:
             while not ppu.frame_complete:
                 if (
@@ -1134,8 +1156,8 @@ class Console:
                     or bus.dma_stall_cycles
                     or apu.cpu_stall_cycles
                 ):
-                    self._flush_pending_devices()
-                    self._drain_stalls()
+                    flush_pending_devices()
+                    drain_stalls()
                     continue
 
                 poll_starts = cpu._poll_loop_starts
@@ -1144,12 +1166,12 @@ class Console:
                     and apu.dmc.bytes_remaining
                     and poll_starts is not None
                     and poll_starts[cpu.pc]
-                    and self._batch_dmc_ram_poll()
+                    and batch_dmc_ram_poll()
                 ):
                     continue
 
                 if self._device_batch_limit <= 0:
-                    self._refresh_device_batch_limit()
+                    refresh_device_batch_limit()
                 remaining_batch_cycles = (
                     self._device_batch_limit - self._pending_cpu_cycles
                 )
@@ -1198,11 +1220,11 @@ class Console:
                         remaining_batch_cycles
                     )
                     if cycles:
-                        self._record_cpu_span(span_pc, cycles, "safe")
-                        self._commit_cpu_batch(cycles)
+                        record_cpu_span(span_pc, cycles, "safe")
+                        commit_cpu_batch(cycles)
                         continue
                 if (
-                    self.idle_batching
+                    idle_batching
                     and remaining_batch_cycles >= 5
                 ):
                     counter_starts = cpu._counter_loop_opcodes
@@ -1214,7 +1236,7 @@ class Console:
                             remaining_batch_cycles
                         )
                         if cycles:
-                            self._record_cpu_span(pc, cycles, "counter")
+                            record_cpu_span(pc, cycles, "counter")
                     if (
                         not cycles
                         and poll_starts is not None
@@ -1224,9 +1246,9 @@ class Console:
                             remaining_batch_cycles
                         )
                         if cycles:
-                            self._record_cpu_span(pc, cycles, "poll")
+                            record_cpu_span(pc, cycles, "poll")
                     if cycles:
-                        self._commit_cpu_batch(cycles)
+                        commit_cpu_batch(cycles)
                         continue
                 # Inspect the first immutable opcode once and dispatch only
                 # the matching PPU polling specialist. The vblank/setup
@@ -1242,7 +1264,7 @@ class Console:
                         and remaining_batch_cycles >= 19
                         and not (ppu.status & 0x80)
                         and not ppu.rendering_enabled
-                        and self._batch_ppu_config_status_wait(
+                        and batch_ppu_config_status_wait(
                             remaining_batch_cycles
                         )
                     ):
@@ -1251,7 +1273,7 @@ class Console:
                         wait_opcode == 0xAD
                         and not (ppu.status & 0x80)
                         and not ppu.rendering_enabled
-                        and self._batch_ppu_status_wait(
+                        and batch_ppu_status_wait(
                             remaining_batch_cycles
                         )
                     ):
@@ -1261,7 +1283,7 @@ class Console:
                         and remaining_batch_cycles >= 9
                         and bus.peek_code((cpu.pc + 3) & 0xFFFF)
                         == 0x29
-                        and self._batch_ppu_sprite_hit_wait(
+                        and batch_ppu_sprite_hit_wait(
                             remaining_batch_cycles
                         )
                     ):
@@ -1269,7 +1291,7 @@ class Console:
                 if (
                     can_defer_ppu_stream
                     and remaining_batch_cycles >= 8
-                    and self._can_defer_ppu_data()
+                    and can_defer_ppu_data()
                 ):
                     span_pc = cpu.pc
                     ppu_batch = cpu.batch_deferred_ppu_stream(
@@ -1287,8 +1309,8 @@ class Console:
                                 )
                                 * 3,
                             )
-                        self._record_cpu_span(span_pc, cycles, "ppu")
-                        self._commit_cpu_batch(cycles)
+                        record_cpu_span(span_pc, cycles, "ppu")
+                        commit_cpu_batch(cycles)
                         continue
                 if (
                     can_batch_cpu_dac
@@ -1306,15 +1328,15 @@ class Console:
                     )
                     if pcm_batch is not None:
                         cycles, events = pcm_batch
-                        if self.diagnostic_hot_cycles is not None:
+                        if diagnostics_enabled:
                             self.diagnostic_pcm_batches += 1
                             self.diagnostic_pcm_writes += len(events)
-                        self._record_cpu_span(
+                        record_cpu_span(
                             0x908D,
                             cycles,
                             "safe",
                         )
-                        self._commit_cpu_driven_pcm_batch(
+                        commit_cpu_driven_pcm_batch(
                             cycles,
                             events,
                         )
@@ -1329,14 +1351,14 @@ class Console:
                         remaining_batch_cycles
                     )
                     if cycles:
-                        self._record_cpu_span(span_pc, cycles, "safe")
-                        self._commit_cpu_batch(cycles)
+                        record_cpu_span(span_pc, cycles, "safe")
+                        commit_cpu_batch(cycles)
                         continue
                 instruction_pc = cpu.pc
-                self._begin_instruction()
+                begin_instruction()
                 cycles = cpu_step()
-                self._record_cpu_span(instruction_pc, cycles, "literal")
-                remaining = self._finish_instruction(cycles)
+                record_cpu_span(instruction_pc, cycles, "literal")
+                remaining = finish_instruction(cycles)
                 self._pending_cpu_cycles += remaining
                 bus.cpu_cycles += remaining
                 if (
@@ -1353,15 +1375,15 @@ class Console:
                     # straddled the edge. That was both inaccurate and made
                     # interrupt timing depend on whether device batching was
                     # enabled.
-                    self._flush_pending_devices()
-                self._end_instruction(cycles)
+                    flush_pending_devices()
+                end_instruction(cycles)
                 if self._device_batch_limit <= 0:
                     # A device-register access flushed the preceding span and
                     # invalidated the deadline during cpu_step().
-                    self._refresh_device_batch_limit()
+                    refresh_device_batch_limit()
 
                 should_idle_batch = (
-                    self.idle_batching
+                    idle_batching
                     and cycles == 3
                     and cpu.last_opcode == 0x4C
                     and cpu.pc == instruction_pc
@@ -1379,7 +1401,7 @@ class Console:
                     or bus.dma_stall_cycles
                     or self._pending_cpu_cycles >= self._device_batch_limit
                 ):
-                    self._flush_pending_devices()
+                    flush_pending_devices()
 
                 if (
                     should_idle_batch
@@ -1391,9 +1413,9 @@ class Console:
                     and not bus.dma_stall_cycles
                     and not apu.cpu_stall_cycles
                 ):
-                    self._batch_cartridge_self_jump()
+                    batch_cartridge_self_jump()
         finally:
-            self._flush_pending_devices()
+            flush_pending_devices()
             bus.sync_devices = None
         return ppu.take_frame(copy=copy_frame)
 

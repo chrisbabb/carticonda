@@ -197,6 +197,10 @@ class PPU:
         self._fast_world_cache_active = False
         self._fast_world_mapper_tokens_seen: set[tuple] = set()
         self._fast_world_recurring_mapper_state = False
+        self._mirroring_cache_value = self.mapper.mirroring
+        self._mirroring_table_map = self._mirroring_table_lookup(
+            self._mirroring_cache_value
+        )
         self._fast_background_mapper_token = (
             self._background_mapper_dependency()
         )
@@ -564,16 +568,7 @@ class PPU:
         base_nt_y = (start_v >> 11) & 1
         effective_nt_y = (base_nt_y + coarse_y // 30) & 1
         tile_y = coarse_y % 30
-        if mirroring == Mirroring.VERTICAL:
-            physical_tables = (0, 1, 0, 1)
-        elif mirroring == Mirroring.HORIZONTAL:
-            physical_tables = (0, 0, 1, 1)
-        elif mirroring == Mirroring.SINGLE_LOWER:
-            physical_tables = (0, 0, 0, 0)
-        elif mirroring == Mirroring.SINGLE_UPPER:
-            physical_tables = (1, 1, 1, 1)
-        else:
-            physical_tables = (0, 1, 2, 3)
+        physical_tables = self._mirroring_table_lookup(mirroring)
 
         # The ordered MMC2 renderer fetches 33 tiles. Even with fine X zero,
         # the final offscreen fetch can change a latch, so both horizontal
@@ -633,21 +628,30 @@ class PPU:
             ),
         )
 
+    @staticmethod
+    def _mirroring_table_lookup(mirroring: Mirroring) -> tuple[int, int, int, int]:
+        if mirroring == Mirroring.VERTICAL:
+            return (0, 1, 0, 1)
+        if mirroring == Mirroring.HORIZONTAL:
+            return (0, 0, 1, 1)
+        if mirroring == Mirroring.SINGLE_LOWER:
+            return (0, 0, 0, 0)
+        if mirroring == Mirroring.SINGLE_UPPER:
+            return (1, 1, 1, 1)
+        return (0, 1, 2, 3)
+
     def _nametable_index(self, address: int) -> int:
         relative = (address - 0x2000) & 0x0FFF
-        table, offset = divmod(relative, 0x400)
-        mirroring = self.cartridge.mapper.mirroring
-        if mirroring == Mirroring.VERTICAL:
-            physical = table & 1
-        elif mirroring == Mirroring.HORIZONTAL:
-            physical = table >> 1
-        elif mirroring == Mirroring.SINGLE_LOWER:
-            physical = 0
-        elif mirroring == Mirroring.SINGLE_UPPER:
-            physical = 1
-        else:
-            physical = table
-        return physical * 0x400 + offset
+        table = relative >> 10
+        offset = relative & 0x03FF
+        mirroring = self.mapper.mirroring
+        if mirroring != self._mirroring_cache_value:
+            self._mirroring_cache_value = mirroring
+            self._mirroring_table_map = self._mirroring_table_lookup(
+                mirroring
+            )
+        physical = self._mirroring_table_map[table]
+        return (physical << 10) + offset
 
     @staticmethod
     def _palette_index(address: int) -> int:

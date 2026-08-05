@@ -27,6 +27,9 @@ class MMC3(Mapper):
         self._refresh_prg_slots()
         self._refresh_chr_offsets()
         self._mirroring = cartridge.header_mirroring
+        self._four_screen = (
+            cartridge.header_mirroring == Mirroring.FOUR_SCREEN
+        )
         self._ppu_cache_token: tuple = ()
         self._ppu_pattern_tokens: tuple[
             tuple[int, int, int, int],
@@ -45,7 +48,7 @@ class MMC3(Mapper):
 
     @property
     def mirroring(self) -> Mirroring:
-        if self.cart.header_mirroring == Mirroring.FOUR_SCREEN:
+        if self._four_screen:
             return Mirroring.FOUR_SCREEN
         return self._mirroring
 
@@ -187,7 +190,7 @@ class MMC3(Mapper):
                     else:
                         self._refresh_prg_slots()
         elif region == 0xA000:
-            if even and self.cart.header_mirroring != Mirroring.FOUR_SCREEN:
+            if even and not self._four_screen:
                 mirroring = (
                     Mirroring.HORIZONTAL if value & 1 else Mirroring.VERTICAL
                 )

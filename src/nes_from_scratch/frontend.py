@@ -70,6 +70,7 @@ AUDIO_IDLE_GRACE_SECONDS = 0.012
 # late, increases latency, and can race SDL's queued-Sound promotion.
 AUDIO_CONCEALMENT_SAMPLES = 256
 PACING_SPIN_SECONDS = 0.00035
+PACING_MICRO_SLEEP_SECONDS = 0.00008
 PACING_LATE_THRESHOLD = 0.001
 PACING_DRAW_GUARD_SECONDS = 0.00020
 # Let the pure-Python core finish its usual 8-10 ms frame in two interpreter
@@ -1294,6 +1295,7 @@ class PygameFrontend:
                 self.console,
                 queue_depth=DEFAULT_QUEUE_DEPTH,
                 rewind_buffer=self.rewind_buffer,
+                measure_timing=self.diagnostics,
             )
             self.emulation_worker = worker
         if worker.running:
@@ -2314,18 +2316,16 @@ class PygameFrontend:
         worker = self.emulation_worker
         if worker is None:
             return None
+        packet = worker.get()
+        if packet is not None:
+            return packet
         while self.running and self.view == "game":
-            packet = worker.get()
-            if packet is not None:
-                return packet
             now = time.perf_counter()
             remaining = deadline - now
             if remaining <= 0:
                 return None
             self._pump_audio()
-            packet = worker.get(
-                timeout=min(AUDIO_PUMP_INTERVAL, remaining)
-            )
+            packet = worker.get(timeout=min(AUDIO_PUMP_INTERVAL, remaining))
             if packet is not None:
                 return packet
         return None
@@ -3819,27 +3819,30 @@ class PygameFrontend:
                     gc.enable()
 
     def _wait_until_frame_deadline(self, deadline: float) -> float:
-        """Sleep coarsely, then use a short bounded spin for stable pacing."""
+        """Sleep coarsely, then use a tiny bounded tail for stable pacing."""
+        perf_counter = time.perf_counter
+        sleep = time.sleep
         while True:
-            now = time.perf_counter()
+            now = perf_counter()
             remaining = deadline - now
             if remaining <= 0:
                 return now
             self._pump_audio()
             if remaining > PACING_SPIN_SECONDS:
-                time.sleep(
+                sleep(
                     min(
                         AUDIO_PUMP_INTERVAL,
                         remaining - PACING_SPIN_SECONDS,
                     )
                 )
                 continue
-            # A sub-millisecond sleep frequently overshoots a Windows frame
-            # deadline by a scheduler quantum. The bounded tail spin costs at
-            # most ~2% of one core at NTSC cadence and removes that jitter.
-            while now < deadline:
-                now = time.perf_counter()
-            return now
+            while True:
+                now = perf_counter()
+                remaining = deadline - now
+                if remaining <= 0:
+                    return now
+                if remaining > PACING_MICRO_SLEEP_SECONDS:
+                    sleep(PACING_MICRO_SLEEP_SECONDS)
 
     def run(self) -> int:
         frame_period = 1.0 / NTSC_FRAME_RATE

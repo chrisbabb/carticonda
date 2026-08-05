@@ -54,6 +54,7 @@ class EmulationWorker:
         *,
         queue_depth: int = DEFAULT_QUEUE_DEPTH,
         rewind_buffer=None,
+        measure_timing: bool = False,
     ) -> None:
         if queue_depth < 1:
             raise ValueError("queue_depth must be positive")
@@ -73,7 +74,7 @@ class EmulationWorker:
         for _ in range(self.queue_depth):
             self._free.put_nowait(bytearray(FRAME_BYTES))
         self._stop = threading.Event()
-        self._input_lock = threading.Lock()
+        self._measure_timing = bool(measure_timing)
         self._inputs = (0, 0)
         self._thread: threading.Thread | None = None
         self._failure: BaseException | None = None
@@ -90,8 +91,9 @@ class EmulationWorker:
         return self._ready.qsize()
 
     def set_inputs(self, player1: int, player2: int) -> None:
-        with self._input_lock:
-            self._inputs = (int(player1) & 0xFF, int(player2) & 0xFF)
+        # Tuple assignment is atomic under the GIL, so readers never observe a
+        # half-written pair and the hot frame path avoids an extra lock hop.
+        self._inputs = (int(player1) & 0xFF, int(player2) & 0xFF)
 
     def start(self) -> None:
         if self.running:
@@ -212,46 +214,61 @@ class EmulationWorker:
 
     def _run(self) -> None:
         frame_buffer: bytearray | None = None
+        console = self.console
+        ppu = console.ppu
+        controller1 = console.controller1
+        controller2 = console.controller2
+        run_frame = console.run_frame
+        drain_samples = console.apu.drain_samples
+        perf_counter = time.perf_counter
+        thread_time = time.thread_time
+        measure_timing = self._measure_timing
         try:
             while not self._stop.is_set():
                 frame_buffer = self._get_free_buffer()
                 if frame_buffer is None:
                     break
-                with self._input_lock:
-                    player1, player2 = self._inputs
-                self.console.controller1.set_buttons(player1)
-                self.console.controller2.set_buttons(player2)
+                player1, player2 = self._inputs
+                controller1.set_buttons(player1)
+                controller2.set_buttons(player2)
 
-                started = time.perf_counter()
-                cpu_started = time.thread_time()
-                scanline_renders_before = int(
-                    getattr(
-                        self.console.ppu,
-                        "diagnostic_scanline_renders",
-                        0,
-                    )
+                fast_mode = bool(getattr(ppu, "fast_mode", True))
+                scanline_renders_before = (
+                    int(getattr(ppu, "diagnostic_scanline_renders", 0))
+                    if fast_mode
+                    else 0
                 )
-                live_frame = self.console.run_frame(copy_frame=False)
-                elapsed = time.perf_counter() - started
-                cpu_elapsed = time.thread_time() - cpu_started
-                video_changed = int(
-                    getattr(
-                        self.console.ppu,
-                        "diagnostic_scanline_renders",
-                        scanline_renders_before + 1,
+                if measure_timing:
+                    started = perf_counter()
+                    cpu_started = thread_time()
+                live_frame = run_frame(copy_frame=False)
+                if measure_timing:
+                    elapsed = perf_counter() - started
+                    cpu_elapsed = thread_time() - cpu_started
+                else:
+                    elapsed = 0.0
+                    cpu_elapsed = 0.0
+                video_changed = (
+                    int(
+                        getattr(
+                            ppu,
+                            "diagnostic_scanline_renders",
+                            scanline_renders_before,
+                        )
                     )
-                ) != scanline_renders_before or not bool(
-                    getattr(self.console.ppu, "fast_mode", True)
+                    != scanline_renders_before
+                    if fast_mode
+                    else True
                 )
                 if video_changed:
                     frame_buffer[:] = live_frame
-                samples = self.console.apu.drain_samples()
+                samples = drain_samples()
                 packet = EmulatedFrame(
                     pixels=frame_buffer,
                     samples=samples,
                     emulation_seconds=elapsed,
                     emulation_cpu_seconds=cpu_elapsed,
-                    frame_number=int(self.console.ppu.frame_number),
+                    frame_number=int(ppu.frame_number),
                     video_changed=video_changed,
                 )
                 if not self._publish(packet):
