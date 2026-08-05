@@ -455,6 +455,18 @@ Run the deterministic benchmark on your machine:
 PYTHONPATH=src python tools/benchmark.py
 ```
 
+For controlled release measurements, run isolated repeats and compare the
+median plus p95 frame time rather than a single sample:
+
+```bash
+python tools/benchmark_repeats.py --repeats 7 --warmup-runs 1 \
+  --cooldown-ms 500 --output-json benchmark_summary.json
+```
+
+The runner launches a fresh Python process per run, reports `median_fps`,
+`p95_frame_ms`, and coefficient-of-variation (`cv_pct`) for each mode, and
+writes machine-readable JSON when `--output-json` is provided.
+
 It reports the optimized interactive path, the same path with idle batching
 disabled, an instruction-synchronized control, the dot-by-dot reference path,
 a rendered fastest-rate looping-DMC workload, and the NMI/OAM/scroll/tonal
