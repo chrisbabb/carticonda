@@ -1,0 +1,3 @@
+[console_scripts]
+cartaconda = nes_from_scratch.cli:main
+nes-from-scratch = nes_from_scratch.cli:main

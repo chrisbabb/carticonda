@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cartaconda"
+version = "3.0.0"
+description = "Cartaconda - Python-powered 8-bit emulation"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Christopher Babb" }]
+dependencies = ["pygame-ce>=2.5.7,<3"]
+
+[project.scripts]
+cartaconda = "nes_from_scratch.cli:main"
+nes-from-scratch = "nes_from_scratch.cli:main"
+
+[tool.setuptools.package-data]
+nes_from_scratch = ["assets/*.png"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
