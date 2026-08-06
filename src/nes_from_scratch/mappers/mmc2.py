@@ -21,6 +21,9 @@ class MMC2(Mapper):
         self.latch_0000_fe = True
         self.latch_1000_fe = True
         self._mirroring = cartridge.header_mirroring
+        self._four_screen = (
+            cartridge.header_mirroring == Mirroring.FOUR_SCREEN
+        )
         self._prg_8k_bank_count = max(1, len(cartridge.prg_rom) // 0x2000)
         self._chr_4k_bank_count = max(1, len(cartridge.chr_memory) // 0x1000)
         prg = cartridge.prg_rom
@@ -41,7 +44,7 @@ class MMC2(Mapper):
 
     @property
     def mirroring(self) -> Mirroring:
-        if self.cart.header_mirroring == Mirroring.FOUR_SCREEN:
+        if self._four_screen:
             return Mirroring.FOUR_SCREEN
         return self._mirroring
 
@@ -119,7 +122,7 @@ class MMC2(Mapper):
             ) * 0x1000
             if self.latch_1000_fe:
                 self._chr_1000_base = self._chr_fe_1000_base
-        elif register == 0xF000 and self.cart.header_mirroring != Mirroring.FOUR_SCREEN:
+        elif register == 0xF000 and not self._four_screen:
             self._mirroring = (
                 Mirroring.HORIZONTAL if value & 1 else Mirroring.VERTICAL
             )

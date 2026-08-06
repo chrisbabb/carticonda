@@ -13,13 +13,16 @@ class Camerica(Mapper):
         super().__init__(cartridge)
         self.prg_bank = 0
         self._mirroring = cartridge.header_mirroring
+        self._four_screen = (
+            cartridge.header_mirroring == Mirroring.FOUR_SCREEN
+        )
         banks = split_banks(cartridge.prg_rom, 0x4000)
         fixed = banks[-1]
         self._cpu_code_windows = tuple(bank + fixed for bank in banks)
 
     @property
     def mirroring(self) -> Mirroring:
-        if self.cart.header_mirroring == Mirroring.FOUR_SCREEN:
+        if self._four_screen:
             return Mirroring.FOUR_SCREEN
         return self._mirroring
 
@@ -50,10 +53,7 @@ class Camerica(Mapper):
             # Only Fire Hawk's BF9097 board decodes this register. Legacy
             # mapper-71 images cannot carry a submapper, and other games do
             # not write here, so accepting it for submapper 0 is compatible.
-            if (
-                self.cart.submapper in (0, 1)
-                and self.cart.header_mirroring != Mirroring.FOUR_SCREEN
-            ):
+            if self.cart.submapper in (0, 1) and not self._four_screen:
                 self._mirroring = (
                     Mirroring.SINGLE_UPPER
                     if value & 0x10

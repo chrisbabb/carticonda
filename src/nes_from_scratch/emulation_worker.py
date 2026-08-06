@@ -234,9 +234,7 @@ class EmulationWorker:
 
                 fast_mode = bool(getattr(ppu, "fast_mode", True))
                 scanline_renders_before = (
-                    int(getattr(ppu, "diagnostic_scanline_renders", 0))
-                    if fast_mode
-                    else 0
+                    ppu.diagnostic_scanline_renders if fast_mode else 0
                 )
                 if measure_timing:
                     started = perf_counter()
@@ -249,14 +247,7 @@ class EmulationWorker:
                     elapsed = 0.0
                     cpu_elapsed = 0.0
                 video_changed = (
-                    int(
-                        getattr(
-                            ppu,
-                            "diagnostic_scanline_renders",
-                            scanline_renders_before,
-                        )
-                    )
-                    != scanline_renders_before
+                    ppu.diagnostic_scanline_renders != scanline_renders_before
                     if fast_mode
                     else True
                 )
