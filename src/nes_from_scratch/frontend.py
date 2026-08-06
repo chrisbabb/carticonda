@@ -65,6 +65,14 @@ AUDIO_PUMP_INTERVAL = 0.002
 # newly promoted PCM and turn a harmless native handoff into audible chopping.
 # Require a stable idle/no-queue observation window before declaring loss.
 AUDIO_IDLE_GRACE_SECONDS = 0.012
+# A queued-Sound handoff normally resolves within one poll, but on some
+# WASAPI configurations get_busy() can lag the actual promotion by far more
+# than AUDIO_IDLE_GRACE_SECONDS -- observed as get_busy() still reporting
+# False tens of milliseconds after a Sound legitimately started playing.
+# Forcing a channel restart is more disruptive than simply waiting, so this
+# grace period stays well above the two native slots' combined ~93 ms of
+# buffered audio instead of reusing the tighter idle threshold.
+AUDIO_HANDOFF_GRACE_SECONDS = 0.2
 # If both SDL_mixer slots genuinely drain, fade the first recovered emulated
 # PCM back in. Never inject a synthetic Sound after a gap: doing so arrives too
 # late, increases latency, and can race SDL's queued-Sound promotion.
@@ -2351,16 +2359,20 @@ class PygameFrontend:
             # SDL_mixer normally owns a queued Sound for only a moment while
             # it promotes to playing; starting or stopping anything here
             # could interrupt that promotion. Some WASAPI configurations
-            # never report the promotion through get_busy(), though, which
-            # would otherwise make this branch wait forever and silently
-            # stop feeding PCM to an already-stalled channel. Give the
-            # native handoff a bounded grace period, then force the channel
-            # back to a known state and recover like a confirmed underrun.
+            # report that promotion through get_busy() far later than a
+            # normal handoff (or not at all), so waiting forever here would
+            # silently stop feeding PCM to an already-stalled channel while
+            # a short timeout would instead interrupt playback that was
+            # actually fine and never given the chance to settle. Give the
+            # native handoff AUDIO_HANDOFF_GRACE_SECONDS -- deliberately much
+            # longer than AUDIO_IDLE_GRACE_SECONDS -- before forcing the
+            # channel back to a known state and recovering like a confirmed
+            # underrun.
             now = time.perf_counter()
             handoff_since = getattr(self, "audio_handoff_since", None)
             if handoff_since is None:
                 self.audio_handoff_since = now
-            elif now - handoff_since >= AUDIO_IDLE_GRACE_SECONDS:
+            elif now - handoff_since >= AUDIO_HANDOFF_GRACE_SECONDS:
                 self.audio_channel.stop()
                 self.audio_handoff_since = None
                 self.audio_idle_since = None

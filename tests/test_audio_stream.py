@@ -346,7 +346,7 @@ class FrontendAudioQueueTests(unittest.TestCase):
 
         with patch(
             "nes_from_scratch.frontend.time.perf_counter",
-            side_effect=(10.000, 10.004, 10.009, 10.013),
+            side_effect=(10.000, 10.050, 10.120, 10.201),
         ):
             frontend._pump_audio()
             self.assertEqual(frontend.audio_handoff_waits, 1)
@@ -355,8 +355,9 @@ class FrontendAudioQueueTests(unittest.TestCase):
             self.assertEqual(frontend.audio_handoff_waits, 2)
             frontend._pump_audio()
             self.assertEqual(frontend.audio_handoff_waits, 3)
-            # 10.013 - 10.000 = 13ms, past the grace period: stop waiting for
-            # a promotion that this simulated driver will never report.
+            # 10.201 - 10.000 = 201ms, past AUDIO_HANDOFF_GRACE_SECONDS
+            # (200ms): stop waiting for a promotion that this simulated
+            # driver will never report.
             frontend._pump_audio()
         self.assertEqual(channel.stop_calls, 1)
         self.assertFalse(frontend.audio_started)
