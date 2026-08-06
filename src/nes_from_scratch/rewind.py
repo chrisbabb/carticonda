@@ -145,7 +145,10 @@ class RewindBuffer:
         # get_state() and pickle must stay on the console owner thread. The
         # resulting byte string is immutable and can safely cross to the
         # compressor without exposing mutable CPU/PPU/APU objects.
-        encoded = pickle.dumps(console.get_state(), protocol=5)
+        encoded = pickle.dumps(
+            console.get_state(include_framebuffer=False),
+            protocol=5,
+        )
         self._last_prepared_frame = frame_number
         return PreparedRewindSnapshot(frame_number, encoded)
 

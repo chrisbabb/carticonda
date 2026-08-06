@@ -1521,11 +1521,13 @@ class Console:
         else:
             raise ValueError("player must be 1 or 2")
 
-    def get_state(self) -> dict:
+    def get_state(self, *, include_framebuffer: bool = True) -> dict:
         return {
             "rom_sha256": self.cartridge.sha256,
             "cpu": self.cpu.get_state(),
-            "ppu": self.ppu.get_state(),
+            "ppu": self.ppu.get_state(
+                include_framebuffer=include_framebuffer,
+            ),
             "apu": self.apu.get_state(),
             "bus": self.bus.get_state(),
             "cartridge": self.cartridge.get_state(),

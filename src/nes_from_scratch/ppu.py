@@ -3143,12 +3143,11 @@ class PPU:
         self.frame_complete = False
         return bytes(self.framebuffer) if copy else self.framebuffer
 
-    def get_state(self) -> dict:
-        return {
+    def get_state(self, *, include_framebuffer: bool = True) -> dict:
+        state = {
             "nametable_ram": bytes(self.nametable_ram),
             "palette_ram": bytes(self.palette_ram),
             "oam": bytes(self.oam),
-            "framebuffer": bytes(self.framebuffer),
             "ctrl": self.ctrl,
             "mask": self.mask,
             "rendering_active": self._rendering_active,
@@ -3184,15 +3183,22 @@ class PPU:
             "nmi_pending_cancellable": self.nmi_pending_cancellable,
             "suppress_vblank": self.suppress_vblank,
         }
+        if include_framebuffer:
+            state["framebuffer"] = bytes(self.framebuffer)
+        return state
 
     def set_state(self, state: dict) -> None:
         self.nametable_ram[:] = bytes(state["nametable_ram"])
         self.palette_ram[:] = bytes(state["palette_ram"])
         self.oam[:] = bytes(state["oam"])
-        framebuffer = bytes(state["framebuffer"])
-        if len(framebuffer) != len(self.framebuffer):
-            raise ValueError("save state has an incompatible frame buffer")
-        self.framebuffer[:] = framebuffer
+        framebuffer = state.get("framebuffer")
+        if framebuffer is not None:
+            framebuffer_bytes = bytes(framebuffer)
+            if len(framebuffer_bytes) != len(self.framebuffer):
+                raise ValueError(
+                    "save state has an incompatible frame buffer"
+                )
+            self.framebuffer[:] = framebuffer_bytes
         scalar_names = (
             "ctrl", "mask", "status", "oam_addr", "open_bus", "read_buffer",
             "v", "t", "fine_x", "bg_pattern_low", "bg_pattern_high",
