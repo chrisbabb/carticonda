@@ -4,6 +4,7 @@ import contextlib
 import io
 import unittest
 from array import array
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -82,11 +83,23 @@ class _FakeApu:
 
 
 class _FakeChannel:
+    """A fake SDL_mixer channel whose busy/queued flags never update.
+
+    Real field reports showed pygame-ce's Channel.get_busy()/get_queue()
+    misreporting for an entire session on some systems -- e.g. get_busy()
+    staying False for thousands of consecutive polls while audio genuinely
+    played, and get_queue() never reporting an empty slot again even
+    immediately after Channel.stop() -- regardless of the underlying SDL
+    audio driver (WASAPI, DirectSound, and WinMM were all affected).
+    Cartaconda no longer consults either method to decide when to submit
+    PCM, so this fake deliberately never updates them either: every test
+    below exercises that independence, not just the ones aimed at it.
+    """
+
     def __init__(self) -> None:
-        self.busy = True
-        self.queued = object()
-        self.played: list[bytes] = []
-        self.queued_pcm: list[bytes] = []
+        self.busy = False
+        self.queued = None
+        self.submitted: list[bytes] = []
         self.queue_failures_remaining = 0
         self.volume = 1.0
         self.stop_calls = 0
@@ -104,16 +117,7 @@ class _FakeChannel:
         if self.queue_failures_remaining:
             self.queue_failures_remaining -= 1
             raise RuntimeError("simulated native queue failure")
-        pcm = bytes(sound)
-        if self.busy:
-            self.queued = sound
-            self.queued_pcm.append(pcm)
-        else:
-            # pygame's documented Channel.queue behavior starts immediately
-            # when there is no current Sound.
-            self.busy = True
-            self.queued = None
-            self.played.append(pcm)
+        self.submitted.append(bytes(sound))
 
     def stop(self) -> None:
         self.stop_calls += 1
@@ -122,14 +126,6 @@ class _FakeChannel:
 
     def set_volume(self, volume: float) -> None:
         self.volume = float(volume)
-
-    def finish_current(self) -> None:
-        """Advance the fake device without ever making a queued stream idle."""
-        if self.queued is None:
-            self.busy = False
-        else:
-            self.queued = None
-            self.busy = True
 
 
 class _FakeSound:
@@ -143,28 +139,6 @@ class _FakeSound:
 
     def set_volume(self, volume: float) -> None:
         self.volume = float(volume)
-
-
-class _NeverBusyChannel(_FakeChannel):
-    """Simulate a driver whose get_busy() never reports a promoted Sound.
-
-    Some WASAPI configurations never observe a queued Sound transition to
-    "busy" through pygame-ce's Channel.get_busy(), unlike the ordinary fake
-    channel above which always promotes a queued Sound once queue() is
-    called from an idle state.
-    """
-
-    def queue(self, sound) -> None:
-        if self.queue_failures_remaining:
-            self.queue_failures_remaining -= 1
-            raise RuntimeError("simulated native queue failure")
-        self.queued = sound
-        self.queued_pcm.append(bytes(sound))
-
-    def stop(self) -> None:
-        self.stop_calls += 1
-        self.busy = False
-        self.queued = None
 
 
 class FrontendAudioQueueTests(unittest.TestCase):
@@ -192,11 +166,11 @@ class FrontendAudioQueueTests(unittest.TestCase):
         frontend.audio_underruns = 0
         frontend.audio_concealments = 0
         frontend.audio_recovery_fades = 0
-        frontend.audio_handoff_waits = 0
-        frontend.audio_grace_restarts = 0
         frontend.audio_start_failures = 0
         frontend.audio_recovering = False
         frontend.audio_idle_since = None
+        frontend.audio_inflight = []
+        frontend.audio_sound_refs = deque(maxlen=8)
         frontend.audio_prebuffer_samples = prebuffer_samples
         frontend.sample_rate = 44_100
         frontend.settings = SimpleNamespace(muted=False, volume=1.0)
@@ -208,47 +182,83 @@ class FrontendAudioQueueTests(unittest.TestCase):
         )
         return frontend
 
-    def test_full_mixer_queue_retains_samples_for_a_later_host_frame(self) -> None:
-        frontend = self.frontend(array("h", range(6)))
-        frontend._queue_audio()
-        self.assertEqual(frontend.audio_buffer.pending_samples, 6)
-        self.assertEqual(frontend.audio_channel.queued_pcm, [])
+    def test_full_native_queue_retains_pending_samples(self) -> None:
+        frontend = self.frontend(array("h", range(6)), prebuffer_samples=4)
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0,
+        ):
+            frontend._queue_audio()
+        self.assertTrue(frontend.audio_started)
+        # 6 samples = one full 4-sample chunk submitted immediately, since
+        # both slots start free; 2 samples remain pending.
+        self.assertEqual(len(frontend.audio_channel.submitted), 1)
+        self.assertEqual(frontend.audio_buffer.pending_samples, 2)
 
-        frontend.audio_channel.queued = None
-        frontend._queue_audio()
+        # Simulate both native slots holding unfinished audio far in the
+        # future -- more pending PCM must not be discarded while we wait.
+        # (104..107 are deliberately distinct from the leftover 4, 5 so the
+        # eventual submission order is unambiguous.)
+        frontend.audio_inflight = [50.0, 50.1]
+        frontend.audio_buffer.append(array("h", (104, 105, 106, 107)))
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.1,
+        ):
+            frontend._pump_audio()
+        self.assertEqual(len(frontend.audio_channel.submitted), 1)
+        self.assertEqual(frontend.audio_buffer.pending_samples, 6)
+
+        # Once our clock believes a slot has freed, the buffered PCM is
+        # submitted without being discarded.
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=50.05,
+        ):
+            frontend._pump_audio()
+        self.assertEqual(len(frontend.audio_channel.submitted), 2)
         self.assertEqual(frontend.audio_buffer.pending_samples, 2)
         self.assertEqual(
-            array("h", frontend.audio_channel.queued_pcm[0]).tolist(),
-            [0, 1, 2, 3],
+            array("h", frontend.audio_channel.submitted[1]).tolist(),
+            [4, 5, 104, 105],
         )
 
     def test_pump_continuously_refills_the_second_mixer_slot(self) -> None:
         frontend = self.frontend(array("h", range(16)), prebuffer_samples=8)
-        frontend.audio_channel.busy = False
-        frontend.audio_channel.queued = None
-
-        frontend._queue_audio()
-        self.assertEqual(len(frontend.audio_channel.played), 1)
-        self.assertEqual(len(frontend.audio_channel.queued_pcm), 1)
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0,
+        ):
+            frontend._queue_audio()
+        # 16 samples, 4-sample chunks: both native slots fill immediately.
+        self.assertEqual(len(frontend.audio_channel.submitted), 2)
         self.assertEqual(frontend.audio_buffer.pending_samples, 8)
 
-        frontend.audio_channel.finish_current()
-        frontend._pump_audio()
-        frontend.audio_channel.finish_current()
-        frontend._pump_audio()
+        # chunk_seconds is a few tens of microseconds at this test's 4-sample
+        # chunk size, so the margin past each boundary must stay well under
+        # one full chunk_seconds or it overshoots into freeing both slots.
+        chunk_seconds = 4 / frontend.sample_rate
+        epsilon = chunk_seconds * 0.1
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0 + chunk_seconds + epsilon,
+        ):
+            frontend._pump_audio()
+        self.assertEqual(len(frontend.audio_channel.submitted), 3)
+        self.assertEqual(frontend.audio_buffer.pending_samples, 4)
 
-        self.assertEqual(len(frontend.audio_channel.played), 1)
-        self.assertEqual(len(frontend.audio_channel.queued_pcm), 3)
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0 + 2 * chunk_seconds + epsilon,
+        ):
+            frontend._pump_audio()
+        self.assertEqual(len(frontend.audio_channel.submitted), 4)
         self.assertEqual(frontend.audio_buffer.pending_samples, 0)
         self.assertEqual(frontend.audio_underruns, 0)
-        submitted = (
-            frontend.audio_channel.played
-            + frontend.audio_channel.queued_pcm
-        )
         self.assertEqual(
             [
                 sample
-                for pcm in submitted
+                for pcm in frontend.audio_channel.submitted
                 for sample in array("h", pcm)
             ],
             list(range(16)),
@@ -257,23 +267,28 @@ class FrontendAudioQueueTests(unittest.TestCase):
 
     def test_stream_reset_releases_retained_native_sounds(self) -> None:
         frontend = self.frontend(array("h", range(8)), prebuffer_samples=8)
-        frontend.audio_channel.busy = False
-        frontend.audio_channel.queued = None
-        frontend._queue_audio()
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0,
+        ):
+            frontend._queue_audio()
         self.assertTrue(frontend.audio_sound_refs)
         frontend._reset_audio_stream()
         self.assertFalse(frontend.audio_sound_refs)
         self.assertFalse(frontend.audio_channel.get_busy())
+        self.assertEqual(frontend.audio_inflight, [])
 
     def test_playback_waits_for_prebuffer_after_an_underrun(self) -> None:
         frontend = self.frontend(array("h", range(8)), prebuffer_samples=8)
-        frontend.audio_channel.busy = False
-        frontend.audio_channel.queued = None
-        frontend._queue_audio()
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0,
+        ):
+            frontend._queue_audio()
         self.assertTrue(frontend.audio_started)
+        self.assertEqual(len(frontend.audio_channel.submitted), 2)
 
-        frontend.audio_channel.busy = False
-        frontend.audio_channel.queued = None
+        frontend.audio_inflight = []
         frontend.audio_buffer.clear()
         frontend.audio_buffer.append(array("h", (20, 21)))
         with patch(
@@ -281,102 +296,65 @@ class FrontendAudioQueueTests(unittest.TestCase):
             side_effect=(10.0, 10.020),
         ):
             frontend._pump_audio()
-            # A single idle observation is not enough to call a transient
-            # SDL_mixer handoff an underrun.
+            # A single low-buffer observation is not enough to declare a
+            # confirmed gap.
             self.assertTrue(frontend.audio_started)
             frontend._pump_audio()
         self.assertFalse(frontend.audio_started)
         self.assertEqual(frontend.audio_underruns, 1)
         self.assertEqual(frontend.audio_concealments, 0)
-        self.assertEqual(len(frontend.audio_channel.played), 1)
+        self.assertEqual(len(frontend.audio_channel.submitted), 2)
 
         frontend.audio_buffer.append(array("h", range(22, 28)))
-        frontend._pump_audio()
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.021,
+        ):
+            frontend._pump_audio()
         self.assertTrue(frontend.audio_started)
-        self.assertEqual(len(frontend.audio_channel.played), 2)
+        self.assertEqual(len(frontend.audio_channel.submitted), 4)
         self.assertFalse(frontend.audio_recovering)
         self.assertEqual(frontend.audio_recovery_fades, 1)
         self.assertEqual(
-            array("h", frontend.audio_channel.played[-1]).tolist(),
+            array("h", frontend.audio_channel.submitted[2]).tolist(),
             [0, 21, 22, 23],
         )
 
-    def test_native_queue_handoff_never_restarts_or_stops_valid_pcm(self) -> None:
-        frontend = self.frontend(array("h", range(8)), prebuffer_samples=8)
-        frontend.audio_channel.busy = False
-        frontend.audio_channel.queued = object()
-
-        frontend._queue_audio()
-
-        self.assertTrue(frontend.audio_started)
-        self.assertEqual(frontend.audio_underruns, 0)
-        self.assertEqual(frontend.audio_handoff_waits, 1)
-        self.assertEqual(frontend.audio_channel.played, [])
-        self.assertEqual(frontend.audio_channel.queued_pcm, [])
-        self.assertEqual(frontend.audio_buffer.pending_samples, 8)
-
-        # Once SDL reports the promoted sound as busy, only the empty queue
-        # slot is refilled. The playing sound is never stopped or replaced.
-        frontend.audio_channel.busy = True
-        frontend.audio_channel.queued = None
-        frontend._pump_audio()
-        self.assertEqual(len(frontend.audio_channel.queued_pcm), 1)
-        self.assertEqual(frontend.audio_buffer.pending_samples, 4)
-        self.assertEqual(frontend.audio_underruns, 0)
-
-    def test_stuck_handoff_recovers_instead_of_stalling_forever(self) -> None:
-        """A get_busy() that never reports a promotion must not stay silent.
-
-        Some WASAPI configurations never observe a queued Sound becoming
-        "busy". Treating that as an always-transient handoff (the previous
-        behavior) waited forever and never queued another chunk, so nothing
-        after the very first chunk was ever audible. The pump must give the
-        handoff a bounded grace period and then force a clean restart.
+    def test_pump_never_touches_a_slot_it_estimates_is_still_playing(
+        self,
+    ) -> None:
+        """The pump must not restart or duplicate a slot before its
+        estimated finish time, even though it never asks SDL_mixer whether
+        that slot is actually still busy.
         """
-        frontend = self.frontend(array("h", range(16)), prebuffer_samples=8)
-        frontend.audio_channel = _NeverBusyChannel()
-        channel = frontend.audio_channel
-        channel.busy = False
-        channel.queued = None
-
-        frontend._queue_audio()
-        self.assertEqual(len(channel.queued_pcm), 1)
-        self.assertEqual(channel.played, [])
-        self.assertEqual(frontend.audio_handoff_waits, 0)
-
+        frontend = self.frontend(array("h", range(8)), prebuffer_samples=8)
         with patch(
             "nes_from_scratch.frontend.time.perf_counter",
-            side_effect=(10.000, 10.050, 10.120, 10.201),
+            return_value=10.0,
+        ):
+            frontend._queue_audio()
+        self.assertEqual(len(frontend.audio_channel.submitted), 2)
+        self.assertEqual(len(frontend.audio_inflight), 2)
+
+        chunk_seconds = 4 / frontend.sample_rate
+        frontend.audio_buffer.append(array("h", (100, 101, 102, 103)))
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0 + chunk_seconds * 0.1,
         ):
             frontend._pump_audio()
-            self.assertEqual(frontend.audio_handoff_waits, 1)
-            self.assertEqual(channel.stop_calls, 0)
-            frontend._pump_audio()
-            self.assertEqual(frontend.audio_handoff_waits, 2)
-            frontend._pump_audio()
-            self.assertEqual(frontend.audio_handoff_waits, 3)
-            # 10.201 - 10.000 = 201ms, past AUDIO_HANDOFF_GRACE_SECONDS
-            # (200ms): stop waiting for a promotion that this simulated
-            # driver will never report.
-            frontend._pump_audio()
-        self.assertEqual(channel.stop_calls, 1)
-        self.assertFalse(frontend.audio_started)
-        self.assertTrue(frontend.audio_recovering)
-        self.assertEqual(frontend.audio_underruns, 1)
-
-        # The stuck Sound is gone and the channel reports idle again, so the
-        # next pump must resume playback instead of staying silent forever.
-        frontend._pump_audio()
-        self.assertTrue(frontend.audio_started)
-        self.assertEqual(len(channel.queued_pcm), 2)
+        self.assertEqual(len(frontend.audio_channel.submitted), 2)
+        self.assertEqual(frontend.audio_channel.stop_calls, 0)
+        self.assertEqual(frontend.audio_underruns, 0)
 
     def test_pcm_arriving_during_idle_grace_resumes_without_underrun(self) -> None:
         frontend = self.frontend(array("h", range(8)), prebuffer_samples=8)
-        frontend.audio_channel.busy = False
-        frontend.audio_channel.queued = None
-        frontend._queue_audio()
-        frontend.audio_channel.busy = False
-        frontend.audio_channel.queued = None
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0,
+        ):
+            frontend._queue_audio()
+        frontend.audio_inflight = []
         frontend.audio_buffer.clear()
         frontend.audio_buffer.append(array("h", (20, 21)))
 
@@ -386,41 +364,49 @@ class FrontendAudioQueueTests(unittest.TestCase):
         ):
             frontend._pump_audio()
         frontend.audio_buffer.append(array("h", (22, 23)))
-        frontend._pump_audio()
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.005,
+        ):
+            frontend._pump_audio()
 
         self.assertTrue(frontend.audio_started)
         self.assertEqual(frontend.audio_underruns, 0)
-        self.assertEqual(frontend.audio_grace_restarts, 1)
-        self.assertEqual(len(frontend.audio_channel.played), 2)
+        self.assertEqual(len(frontend.audio_channel.submitted), 3)
         self.assertEqual(
-            array("h", frontend.audio_channel.played[-1]).tolist(),
+            array("h", frontend.audio_channel.submitted[-1]).tolist(),
             [20, 21, 22, 23],
         )
 
-    def test_long_stream_survives_native_handoffs_without_pcm_loss(self) -> None:
+    def test_long_stream_survives_without_pcm_loss(self) -> None:
         frontend = self.frontend(array("h", range(8)), prebuffer_samples=8)
         channel = frontend.audio_channel
-        channel.busy = False
-        channel.queued = None
-        frontend._queue_audio()
+        now = 10.0
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=now,
+        ):
+            frontend._queue_audio()
 
+        chunk_seconds = 4 / frontend.sample_rate
         for block in range(2, 202):
-            if block % 7 == 0:
-                # Model the short pygame/SDL observation window that caused
-                # 2.2.8 to stop a valid promoted Sound hundreds of times.
-                channel.busy = False
-                frontend._pump_audio()
-                self.assertGreaterEqual(frontend.audio_handoff_waits, 1)
-            channel.finish_current()
             first = block * 4
             frontend.audio_buffer.append(
                 array("h", range(first, first + 4))
             )
-            frontend._pump_audio()
+            now += chunk_seconds + 0.0005
+            with patch(
+                "nes_from_scratch.frontend.time.perf_counter",
+                return_value=now,
+            ):
+                frontend._pump_audio()
 
-        submitted = channel.played + channel.queued_pcm
         self.assertEqual(
-            [sample for pcm in submitted for sample in array("h", pcm)],
+            [
+                sample
+                for pcm in channel.submitted
+                for sample in array("h", pcm)
+            ],
             list(range(808)),
         )
         self.assertEqual(frontend.audio_underruns, 0)
@@ -428,41 +414,52 @@ class FrontendAudioQueueTests(unittest.TestCase):
 
     def test_failed_sound_start_is_safe_and_keeps_pcm_for_retry(self) -> None:
         frontend = self.frontend(array("h", range(8)), prebuffer_samples=8)
-        frontend.audio_channel.busy = False
-        frontend.audio_channel.queued = None
         frontend.audio_channel.queue_failures_remaining = 1
 
-        frontend._queue_audio()
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0,
+        ):
+            frontend._queue_audio()
 
         self.assertTrue(frontend.audio_started)
         self.assertEqual(frontend.audio_start_failures, 1)
         self.assertEqual(frontend.audio_buffer.pending_samples, 8)
-        self.assertEqual(frontend.audio_channel.played, [])
+        self.assertEqual(frontend.audio_channel.submitted, [])
 
-        frontend._pump_audio()
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0,
+        ):
+            frontend._pump_audio()
         self.assertTrue(frontend.audio_started)
         self.assertEqual(frontend.audio_buffer.pending_samples, 0)
-        self.assertEqual(len(frontend.audio_channel.played), 1)
+        self.assertEqual(len(frontend.audio_channel.submitted), 2)
 
     def test_transient_wasapi_start_race_retries_without_losing_pcm(
         self,
     ) -> None:
         frontend = self.frontend(array("h", range(8)), prebuffer_samples=8)
-        frontend.audio_channel.busy = False
-        frontend.audio_channel.queued = None
         frontend.audio_channel.queue_failures_remaining = 1
 
-        frontend._queue_audio()
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0,
+        ):
+            frontend._queue_audio()
 
         self.assertTrue(frontend.audio_started)
         self.assertEqual(frontend.audio_start_failures, 1)
         self.assertEqual(frontend.audio_buffer.pending_samples, 8)
 
-        frontend._pump_audio()
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0,
+        ):
+            frontend._pump_audio()
         self.assertTrue(frontend.audio_started)
         self.assertEqual(frontend.audio_buffer.pending_samples, 0)
-        self.assertEqual(len(frontend.audio_channel.played), 1)
-        self.assertEqual(len(frontend.audio_channel.queued_pcm), 1)
+        self.assertEqual(len(frontend.audio_channel.submitted), 2)
 
     def test_muting_skips_host_pcm_generation_until_unmuted(self) -> None:
         frontend = self.frontend(array("h", (1, 2, 3)))
@@ -479,9 +476,11 @@ class FrontendAudioQueueTests(unittest.TestCase):
     def test_volume_is_attached_to_each_chunk_across_queue_handoffs(self) -> None:
         frontend = self.frontend(array("h", range(8)), prebuffer_samples=8)
         frontend.settings.volume = 0.375
-        frontend.audio_channel.busy = False
-        frontend.audio_channel.queued = None
-        frontend._queue_audio()
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            return_value=10.0,
+        ):
+            frontend._queue_audio()
 
         sounds = tuple(frontend.audio_sound_refs)
         self.assertEqual(len(sounds), 2)
@@ -990,8 +989,6 @@ class FrontendDiagnosticsTests(unittest.TestCase):
             completed_at=1.0 + frame_period + 0.0005,
         )
         frontend.audio_underruns = 0
-        frontend.audio_handoff_waits = 0
-        frontend.audio_grace_restarts = 0
         frontend.audio_start_failures = 0
         frontend.audio_buffer = PcmBuffer()
         frontend.gamepad_events = 0
@@ -1039,8 +1036,6 @@ class FrontendDiagnosticsTests(unittest.TestCase):
         self.assertIn("cpu-bank-deferrals=", line)
         self.assertIn("audio-concealments=", line)
         self.assertIn("audio-recovery-fades=", line)
-        self.assertIn("audio-handoff-waits=", line)
-        self.assertIn("audio-grace-restarts=", line)
         self.assertIn("ppu-status-probes=", line)
         self.assertIn("ppu-mapper-invalidations=", line)
         self.assertIn("clean-shutdown=yes", line)

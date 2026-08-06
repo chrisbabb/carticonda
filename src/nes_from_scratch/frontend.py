@@ -60,19 +60,17 @@ AUDIO_CHUNK_SAMPLES = 2048
 AUDIO_PREBUFFER_CHUNKS = 2
 AUDIO_MIXER_BUFFER_SAMPLES = 2048
 AUDIO_PUMP_INTERVAL = 0.002
-# SDL_mixer can briefly expose ``busy=False`` while promoting its queued Sound
-# to the playing slot. Treating that single poll as an underrun can stop the
-# newly promoted PCM and turn a harmless native handoff into audible chopping.
-# Require a stable idle/no-queue observation window before declaring loss.
+# Channel.get_busy()/get_queue() are not used to decide when to submit PCM.
+# Field reports showed both misreporting for an entire session on some
+# systems regardless of SDL audio driver (WASAPI, DirectSound, WinMM all
+# affected) -- e.g. get_busy() staying False for thousands of consecutive
+# polls while audio genuinely played, and get_queue() never reporting an
+# empty slot again even immediately after Channel.stop(). Submission is
+# instead paced from playback duration (chunk_samples / sample_rate) tracked
+# locally in ``audio_inflight``. A gap is declared only when the buffer
+# itself has too little pending PCM to fill a slot our own clock believes is
+# free, for at least this long.
 AUDIO_IDLE_GRACE_SECONDS = 0.012
-# A queued-Sound handoff normally resolves within one poll, but on some
-# WASAPI configurations get_busy() can lag the actual promotion by far more
-# than AUDIO_IDLE_GRACE_SECONDS -- observed as get_busy() still reporting
-# False tens of milliseconds after a Sound legitimately started playing.
-# Forcing a channel restart is more disruptive than simply waiting, so this
-# grace period stays well above the two native slots' combined ~93 ms of
-# buffered audio instead of reusing the tighter idle threshold.
-AUDIO_HANDOFF_GRACE_SECONDS = 0.2
 # If both SDL_mixer slots genuinely drain, fade the first recovered emulated
 # PCM back in. Never inject a synthetic Sound after a gap: doing so arrives too
 # late, increases latency, and can race SDL's queued-Sound promotion.
@@ -444,12 +442,14 @@ class PygameFrontend:
         self.audio_underruns = 0
         self.audio_concealments = 0
         self.audio_recovery_fades = 0
-        self.audio_handoff_waits = 0
-        self.audio_grace_restarts = 0
         self.audio_start_failures = 0
         self.audio_recovering = False
         self.audio_idle_since: float | None = None
-        self.audio_handoff_since: float | None = None
+        # Estimated perf_counter() finish time of each PCM chunk currently
+        # occupying one of SDL_mixer's two channel slots (current + queued),
+        # oldest first. See AUDIO_IDLE_GRACE_SECONDS for why this replaces
+        # Channel.get_busy()/get_queue() as the pacing signal.
+        self.audio_inflight: list[float] = []
         self.audio_sound_refs = deque(maxlen=8)
         self.audio_prebuffer_samples = (
             self.audio_buffer.chunk_samples * AUDIO_PREBUFFER_CHUNKS
@@ -1149,10 +1149,6 @@ class PygameFrontend:
             f"{getattr(self, 'audio_concealments', 0)} "
             f"audio-recovery-fades="
             f"{getattr(self, 'audio_recovery_fades', 0)} "
-            f"audio-handoff-waits="
-            f"{getattr(self, 'audio_handoff_waits', 0)} "
-            f"audio-grace-restarts="
-            f"{getattr(self, 'audio_grace_restarts', 0)} "
             f"audio-start-failures={self.audio_start_failures} "
             f"audio-resyncs={self.audio_buffer.resyncs} "
             f"gamepad-events={self.gamepad_events} "
@@ -1798,7 +1794,7 @@ class PygameFrontend:
             self.audio_channel.stop()
         self.audio_recovering = False
         self.audio_idle_since = None
-        self.audio_handoff_since = None
+        self.audio_inflight = []
         references = getattr(self, "audio_sound_refs", None)
         if references is not None:
             references.clear()
@@ -2352,66 +2348,52 @@ class PygameFrontend:
             if self.audio_buffer.pending_samples < self.audio_prebuffer_samples:
                 return
             self.audio_started = True
+            self.audio_inflight = []
 
-        busy = self.audio_channel.get_busy()
-        queued = self.audio_channel.get_queue()
-        if not busy and queued is not None:
-            # SDL_mixer normally owns a queued Sound for only a moment while
-            # it promotes to playing; starting or stopping anything here
-            # could interrupt that promotion. Some WASAPI configurations
-            # report that promotion through get_busy() far later than a
-            # normal handoff (or not at all), so waiting forever here would
-            # silently stop feeding PCM to an already-stalled channel while
-            # a short timeout would instead interrupt playback that was
-            # actually fine and never given the chance to settle. Give the
-            # native handoff AUDIO_HANDOFF_GRACE_SECONDS -- deliberately much
-            # longer than AUDIO_IDLE_GRACE_SECONDS -- before forcing the
-            # channel back to a known state and recovering like a confirmed
-            # underrun.
-            now = time.perf_counter()
-            handoff_since = getattr(self, "audio_handoff_since", None)
-            if handoff_since is None:
-                self.audio_handoff_since = now
-            elif now - handoff_since >= AUDIO_HANDOFF_GRACE_SECONDS:
-                self.audio_channel.stop()
-                self.audio_handoff_since = None
-                self.audio_idle_since = None
-                self.audio_underruns += 1
-                self.audio_started = False
-                self.audio_recovering = True
-                return
+        now = time.perf_counter()
+        inflight = self.audio_inflight
+        while inflight and now >= inflight[0]:
+            inflight.pop(0)
+
+        chunk_samples = self.audio_buffer.chunk_samples
+        sample_rate = self.sample_rate
+        chunk_seconds = (
+            chunk_samples / sample_rate
+            if sample_rate > 0
+            else AUDIO_IDLE_GRACE_SECONDS
+        )
+
+        if len(inflight) >= 2:
+            # Both native slots are still estimated to hold unfinished audio.
             self.audio_idle_since = None
-            self.audio_handoff_waits += 1
             return
-        self.audio_handoff_since = None
 
-        pending = self.audio_buffer.pending_samples
-        if (
-            not busy
-            and queued is None
-            and pending < self.audio_buffer.chunk_samples
-        ):
-            now = time.perf_counter()
+        if self.audio_buffer.pending_samples < chunk_samples:
+            # Nothing ready to submit for a slot our own clock believes is
+            # free. This is a genuine gap only if it persists.
             idle_since = self.audio_idle_since
             if idle_since is None:
                 self.audio_idle_since = now
                 return
             if now - idle_since < AUDIO_IDLE_GRACE_SECONDS:
                 return
-            # The channel has remained truly idle across multiple main-loop
-            # audio pumps. Rebuild the reservoir and fade only the recovered
-            # emulated PCM; a synthetic tail played after the gap would be too
-            # late and could race the native queue again.
+            # Force the channel back to a known state and rebuild the
+            # reservoir; fade only the recovered emulated PCM back in. A
+            # synthetic tail played after the gap would be too late and
+            # could race whatever the native channel is actually doing.
+            self.audio_channel.stop()
+            self.audio_inflight = []
             self.audio_underruns += 1
             self.audio_started = False
             self.audio_recovering = True
             self.audio_idle_since = None
             return
-        if self.audio_idle_since is not None:
-            if not busy and queued is None:
-                self.audio_grace_restarts += 1
-            self.audio_idle_since = None
-        while self.audio_channel.get_queue() is None:
+        self.audio_idle_since = None
+
+        while (
+            len(inflight) < 2
+            and self.audio_buffer.pending_samples >= chunk_samples
+        ):
             pcm_view = self.audio_buffer.peek_chunk()
             if pcm_view is None:
                 break
@@ -2434,7 +2416,7 @@ class PygameFrontend:
                 count = min(
                     len(recovered),
                     AUDIO_CONCEALMENT_SAMPLES,
-                    max(2, self.audio_buffer.chunk_samples // 8),
+                    max(2, chunk_samples // 8),
                 )
                 if count >= 2:
                     denominator = count - 1
@@ -2448,35 +2430,31 @@ class PygameFrontend:
                 sound.set_volume(
                     0.0 if self.settings.muted else self.settings.volume
                 )
-                # Channel.queue is the only pygame-ce entry point needed for
-                # this stream. Its contract is atomic at the SDL_mixer layer:
-                # it fills the next slot when audio is active and starts the
-                # Sound immediately when the channel is idle. Unlike either
-                # play() variant, it cannot replace a Sound that SDL promoted
-                # between two Python state queries.
+                # Channel.queue fills the next native slot when one is
+                # already playing and starts the Sound immediately when the
+                # channel is idle. It is called here purely to submit PCM;
+                # whether/when SDL_mixer's own get_busy()/get_queue() ever
+                # reflect that submission does not gate anything above.
                 self.audio_channel.queue(sound)
             except self.pg.error:
                 # Keep the exact PCM in staging for the next host pump. Never
-                # stop the channel here: another Sound may have begun between
-                # the query and the failed submission. Playback may still own
-                # its current Sound, so keep the stream started and retry this
-                # exact chunk at the next two-millisecond service point rather
-                # than waiting for a new four-chunk prebuffer.
+                # stop the channel here: playback may still own whatever it
+                # already had queued, so keep the stream started and retry
+                # this exact chunk at the next service point rather than
+                # waiting for a new prebuffer.
                 self.audio_start_failures += 1
                 break
 
             # Advance staging only after the mixer accepted this exact chunk.
             self.audio_buffer.discard_chunk()
+            start_at = inflight[-1] if inflight else now
+            inflight.append(start_at + chunk_seconds)
             if recovering:
                 self.audio_recovering = False
                 self.audio_recovery_fades = (
                     int(getattr(self, "audio_recovery_fades", 0)) + 1
                 )
-            references = getattr(self, "audio_sound_refs", None)
-            if references is None:
-                references = deque(maxlen=8)
-                self.audio_sound_refs = references
-            references.append(sound)
+            self.audio_sound_refs.append(sound)
 
     @staticmethod
     def _fit_rect(
