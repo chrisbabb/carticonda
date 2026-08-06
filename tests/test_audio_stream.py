@@ -144,6 +144,29 @@ class _FakeSound:
     def set_volume(self, volume: float) -> None:
         self.volume = float(volume)
 
+
+class _NeverBusyChannel(_FakeChannel):
+    """Simulate a driver whose get_busy() never reports a promoted Sound.
+
+    Some WASAPI configurations never observe a queued Sound transition to
+    "busy" through pygame-ce's Channel.get_busy(), unlike the ordinary fake
+    channel above which always promotes a queued Sound once queue() is
+    called from an idle state.
+    """
+
+    def queue(self, sound) -> None:
+        if self.queue_failures_remaining:
+            self.queue_failures_remaining -= 1
+            raise RuntimeError("simulated native queue failure")
+        self.queued = sound
+        self.queued_pcm.append(bytes(sound))
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self.busy = False
+        self.queued = None
+
+
 class FrontendAudioQueueTests(unittest.TestCase):
     def test_native_queue_covers_long_spikes_without_more_prebuffer(self) -> None:
         self.assertEqual(AUDIO_CHUNK_SAMPLES, 2048)
@@ -300,6 +323,51 @@ class FrontendAudioQueueTests(unittest.TestCase):
         self.assertEqual(len(frontend.audio_channel.queued_pcm), 1)
         self.assertEqual(frontend.audio_buffer.pending_samples, 4)
         self.assertEqual(frontend.audio_underruns, 0)
+
+    def test_stuck_handoff_recovers_instead_of_stalling_forever(self) -> None:
+        """A get_busy() that never reports a promotion must not stay silent.
+
+        Some WASAPI configurations never observe a queued Sound becoming
+        "busy". Treating that as an always-transient handoff (the previous
+        behavior) waited forever and never queued another chunk, so nothing
+        after the very first chunk was ever audible. The pump must give the
+        handoff a bounded grace period and then force a clean restart.
+        """
+        frontend = self.frontend(array("h", range(16)), prebuffer_samples=8)
+        frontend.audio_channel = _NeverBusyChannel()
+        channel = frontend.audio_channel
+        channel.busy = False
+        channel.queued = None
+
+        frontend._queue_audio()
+        self.assertEqual(len(channel.queued_pcm), 1)
+        self.assertEqual(channel.played, [])
+        self.assertEqual(frontend.audio_handoff_waits, 0)
+
+        with patch(
+            "nes_from_scratch.frontend.time.perf_counter",
+            side_effect=(10.000, 10.004, 10.009, 10.013),
+        ):
+            frontend._pump_audio()
+            self.assertEqual(frontend.audio_handoff_waits, 1)
+            self.assertEqual(channel.stop_calls, 0)
+            frontend._pump_audio()
+            self.assertEqual(frontend.audio_handoff_waits, 2)
+            frontend._pump_audio()
+            self.assertEqual(frontend.audio_handoff_waits, 3)
+            # 10.013 - 10.000 = 13ms, past the grace period: stop waiting for
+            # a promotion that this simulated driver will never report.
+            frontend._pump_audio()
+        self.assertEqual(channel.stop_calls, 1)
+        self.assertFalse(frontend.audio_started)
+        self.assertTrue(frontend.audio_recovering)
+        self.assertEqual(frontend.audio_underruns, 1)
+
+        # The stuck Sound is gone and the channel reports idle again, so the
+        # next pump must resume playback instead of staying silent forever.
+        frontend._pump_audio()
+        self.assertTrue(frontend.audio_started)
+        self.assertEqual(len(channel.queued_pcm), 2)
 
     def test_pcm_arriving_during_idle_grace_resumes_without_underrun(self) -> None:
         frontend = self.frontend(array("h", range(8)), prebuffer_samples=8)

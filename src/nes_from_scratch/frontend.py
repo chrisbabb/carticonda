@@ -441,6 +441,7 @@ class PygameFrontend:
         self.audio_start_failures = 0
         self.audio_recovering = False
         self.audio_idle_since: float | None = None
+        self.audio_handoff_since: float | None = None
         self.audio_sound_refs = deque(maxlen=8)
         self.audio_prebuffer_samples = (
             self.audio_buffer.chunk_samples * AUDIO_PREBUFFER_CHUNKS
@@ -1789,6 +1790,7 @@ class PygameFrontend:
             self.audio_channel.stop()
         self.audio_recovering = False
         self.audio_idle_since = None
+        self.audio_handoff_since = None
         references = getattr(self, "audio_sound_refs", None)
         if references is not None:
             references.clear()
@@ -2346,12 +2348,30 @@ class PygameFrontend:
         busy = self.audio_channel.get_busy()
         queued = self.audio_channel.get_queue()
         if not busy and queued is not None:
-            # SDL_mixer owns a queued Sound but is between observable channel
-            # states. Starting or stopping anything here can interrupt the
-            # Sound it is promoting. Let the native handoff settle.
+            # SDL_mixer normally owns a queued Sound for only a moment while
+            # it promotes to playing; starting or stopping anything here
+            # could interrupt that promotion. Some WASAPI configurations
+            # never report the promotion through get_busy(), though, which
+            # would otherwise make this branch wait forever and silently
+            # stop feeding PCM to an already-stalled channel. Give the
+            # native handoff a bounded grace period, then force the channel
+            # back to a known state and recover like a confirmed underrun.
+            now = time.perf_counter()
+            handoff_since = getattr(self, "audio_handoff_since", None)
+            if handoff_since is None:
+                self.audio_handoff_since = now
+            elif now - handoff_since >= AUDIO_IDLE_GRACE_SECONDS:
+                self.audio_channel.stop()
+                self.audio_handoff_since = None
+                self.audio_idle_since = None
+                self.audio_underruns += 1
+                self.audio_started = False
+                self.audio_recovering = True
+                return
             self.audio_idle_since = None
             self.audio_handoff_waits += 1
             return
+        self.audio_handoff_since = None
 
         pending = self.audio_buffer.pending_samples
         if (
