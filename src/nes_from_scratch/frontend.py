@@ -436,6 +436,7 @@ class PygameFrontend:
         self.gamepads_requested = bool(gamepads)
         self.diagnostics = bool(diagnostics)
         self.audio_available = False
+        self.audio_init_error: str | None = None
         self.audio_channel = None
         self.audio_buffer = PcmBuffer(chunk_samples=AUDIO_CHUNK_SAMPLES)
         self.audio_started = False
@@ -889,8 +890,13 @@ class PygameFrontend:
                     buffer=AUDIO_MIXER_BUFFER_SAMPLES,
                     allowedchanges=self.pg.AUDIO_ALLOW_FREQUENCY_CHANGE,
                 )
-            except self.pg.error:
-                pass
+            except self.pg.error as exc:
+                # Surfaced by --diagnostics as audio-init-error= so a failed
+                # mixer.init() (wrong/unavailable SDL_AUDIODRIVER, device
+                # held exclusively by another app, missing driver, ...) is
+                # diagnosable instead of silently reporting mixer=disabled
+                # with no indication of why.
+                self.audio_init_error = str(exc)
         if self.gamepads_requested:
             try:
                 self.pg.joystick.init()
@@ -962,6 +968,8 @@ class PygameFrontend:
             f"thread-switch-ms={EMULATION_THREAD_SWITCH_SECONDS * 1000:.1f} "
             f"mixer={mixer or 'disabled'} "
             f"mixer-driver={mixer_driver} "
+            f"audio-init-error="
+            f"{(self.audio_init_error or 'none').replace(' ', '_')} "
             f"PCM-chunk={self.audio_buffer.chunk_samples} "
             f"mixer-buffer={AUDIO_MIXER_BUFFER_SAMPLES} "
             f"audio-start=channel-queue "
